@@ -43,6 +43,17 @@ void BusT4Cover::loop() {
     }
   }
 
+  // Auto re-discovery: if we were initialized but lost communication for >60s,
+  // reset to discovery mode. This handles bus sleep, power glitches, etc.
+  if (init_ok_ && last_bus_response_ > 0 && (now - last_bus_response_ > 60000)) {
+    ESP_LOGW(TAG, "Bus communication lost for >60s, resetting to discovery mode");
+    init_ok_ = false;
+    init_step_ = 0;
+    discovery_attempts_ = 0;
+    last_init_attempt_ = 0;
+    last_bus_response_ = 0;
+  }
+
   // Periodic status refresh every 15 seconds
   // This helps recover from missed packets and keeps state in sync
   if (init_ok_ && (now - last_status_refresh_ > 15000)) {
@@ -221,15 +232,32 @@ void BusT4Cover::on_packet(const T4Packet &packet) {
   // Check if this is an OXI receiver packet (remote control)
   // These packets have target FOR_OXI (0x0A) in byte 9
   if (packet.size >= 14 && packet.data[9] == FOR_OXI) {
+    last_bus_response_ = millis();  // OXI packets are valid bus traffic
     parse_oxi_packet(packet);
     return;
   }
 
-  // During initialization, accept packets from any source (for device discovery)
+  // During initialization: detect controller from ANY packet it sends
+  // Some controllers (e.g., Nice MCA2) don't respond to INF_WHO discovery
+  // but DO broadcast DEP packets during movement. Accept those as discovery.
+  if (!init_ok_ && init_step_ == 0) {
+    // Accept DEP packets from endpoint 0x03 (motor controller) as discovery
+    if (packet.header.protocol == DEP && packet.header.from.endpoint == 0x03) {
+      ESP_LOGI(TAG, "Discovered controller from DEP broadcast at 0x%02X.%02X",
+               packet.header.from.address, packet.header.from.endpoint);
+      target_address_ = packet.header.from;
+      init_step_ = 1;  // Move to next init step
+      discovery_attempts_ = 0;  // Reset backoff
+    }
+  }
+
   // After init, only process packets from our target controller
   if (init_ok_ && packet.header.from != target_address_) {
     return;
   }
+
+  // Track last valid response from the controller
+  last_bus_response_ = millis();
 
   ESP_LOGV(TAG, "Received packet from 0x%02X.%02X, protocol=%d",
            packet.header.from.address, packet.header.from.endpoint, packet.header.protocol);
@@ -693,6 +721,16 @@ void BusT4Cover::parse_dmp_packet(const T4Packet &packet) {
           }
           ESP_LOGI(TAG, "Product: %s", product_name_.c_str());
 
+          // If still in discovery (step 0), accept PRD response as discovery
+          // Some controllers (e.g., Nice MCA2) respond to PRD but not WHO
+          if (init_step_ == 0 && packet.header.from.endpoint == 0x03) {
+            ESP_LOGI(TAG, "Discovered controller from PRD response at 0x%02X.%02X",
+                     packet.header.from.address, packet.header.from.endpoint);
+            target_address_ = packet.header.from;
+            init_step_ = 1;
+            discovery_attempts_ = 0;
+          }
+
           // Detect device-specific modes based on product name prefix
           if (product_name_.find(PRODUCT_WALKY) == 0) {
             is_walky_ = true;
@@ -772,6 +810,11 @@ void BusT4Cover::parse_oxi_packet(const T4Packet &packet) {
 
     ESP_LOGI(TAG, "Remote: serial=%08X, cmd=%d, btn=%d, mode=%d, presses=%d",
              remote_serial, remote_command, remote_button, remote_mode, press_count);
+
+    // Store for external access
+    last_remote_serial_ = remote_serial;
+    last_remote_button_ = remote_button;
+    last_remote_event_time_ = millis();
   }
 
   // Button read packet (0x26, 0x41)
@@ -781,6 +824,11 @@ void BusT4Cover::parse_oxi_packet(const T4Packet &packet) {
     uint32_t remote_serial = (payload[0] & 0x0F) | (payload[1] << 4) | (payload[2] << 12) | (payload[3] << 20);
 
     ESP_LOGI(TAG, "Button press: btn=%d, remote=%05X", button, remote_serial);
+
+    // Store for external access
+    last_remote_serial_ = remote_serial;
+    last_remote_button_ = button;
+    last_remote_event_time_ = millis();
   }
 }
 
@@ -791,12 +839,20 @@ void BusT4Cover::init_device() {
   switch (init_step_) {
     case 0: {
       // Step 0: Discover devices on the bus
+      // Send both WHO and PRD queries (like pruwait original)
+      // Some controllers don't respond to WHO but respond to PRD
+      // Also, controllers that don't respond to either will be discovered
+      // from their DEP broadcast packets (handled in on_packet)
       discovery_attempts_++;
       ESP_LOGI(TAG, "Initializing device - discovering... (attempt %d)", discovery_attempts_);
       T4Source broadcast{0xFF, 0xFF};
       uint8_t who_msg[5] = { FOR_ALL, INF_WHO, REQ_GET, 0x00, 0x00 };
       T4Packet who_packet(broadcast, parent_->get_address(), DMP, who_msg, sizeof(who_msg));
       write(&who_packet, 0);
+      // Also send PRD query - some controllers respond to this but not WHO
+      uint8_t prd_msg[5] = { FOR_ALL, INF_PRD, REQ_GET, 0x00, 0x00 };
+      T4Packet prd_packet(broadcast, parent_->get_address(), DMP, prd_msg, sizeof(prd_msg));
+      write(&prd_packet, 0);
       break;
     }
 
@@ -1137,6 +1193,12 @@ void BusT4Cover::send_raw_cmd(const std::string &data) {
 
   ESP_LOGI(TAG, "Sending raw command: %s", format_hex_pretty(bytes).c_str());
   parent_->write_raw(bytes.data(), bytes.size());
+}
+
+bool BusT4Cover::is_bus_connected() const {
+  if (last_bus_response_ == 0) return false;
+  uint32_t elapsed = millis() - last_bus_response_;
+  return elapsed < 60000;  // Connected if response within last 60 seconds
 }
 
 uint32_t BusT4Cover::get_discovery_interval() const {
