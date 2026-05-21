@@ -840,13 +840,17 @@ void BusT4Cover::init_device() {
 
   switch (init_step_) {
     case 0: {
-      // Step 0: Send status request to known controller address
-      // Don't advance to step 1 here - wait for on_packet() to confirm
-      // the controller responded before proceeding with init
+      // Step 0: Try to get a response from the controller
+      // Some controllers (e.g., Nice MCA2) don't respond to DMP info requests
+      // when the bus is idle, but DO respond to DEP command packets.
+      // Send both: a DMP status request AND a CMD_STOP (which is harmless if gate is stopped)
       discovery_attempts_++;
       ESP_LOGI(TAG, "Requesting status from controller at 0x%02X.%02X (attempt %d)",
                target_address_.address, target_address_.endpoint, discovery_attempts_);
+      // Try DMP info request first
       send_info_request(FOR_CU, INF_STATUS);
+      // Also send CMD_STOP - harmless if already stopped, but may wake the controller
+      send_cmd(CMD_STOP);
       // Stay in step 0 until on_packet() advances us
       break;
     }
