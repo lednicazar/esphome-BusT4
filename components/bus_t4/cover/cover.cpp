@@ -32,11 +32,11 @@ void BusT4Cover::setup() {
 void BusT4Cover::loop() {
   uint32_t now = millis();
 
-  // Initialization state machine with exponential backoff
-  // Step 0 (discovery) uses longer intervals to avoid flooding the bus
-  // Other steps use shorter intervals since we're talking to a known device
+  // Initialization state machine
+  // Step 0 retries every 10s (direct status request to known address)
+  // Other steps use shorter intervals since we're in a conversation
   if (!init_ok_) {
-    uint32_t retry_interval = (init_step_ == 0) ? get_discovery_interval() : 500;
+    uint32_t retry_interval = (init_step_ == 0) ? 10000 : 500;
     if (now - last_init_attempt_ > retry_interval) {
       last_init_attempt_ = now;
       init_device();
@@ -237,17 +237,24 @@ void BusT4Cover::on_packet(const T4Packet &packet) {
     return;
   }
 
-  // During initialization: detect controller from ANY packet it sends
-  // Some controllers (e.g., Nice MCA2) don't respond to INF_WHO discovery
-  // but DO broadcast DEP packets during movement. Accept those as discovery.
+  // During initialization step 0: waiting for ANY response from the controller
+  // Accept both DMP responses (to our status request) and DEP broadcasts (from movement)
   if (!init_ok_ && init_step_ == 0) {
-    // Accept DEP packets from endpoint 0x03 (motor controller) as discovery
-    if (packet.header.protocol == DEP && packet.header.from.endpoint == 0x03) {
-      ESP_LOGI(TAG, "Discovered controller from DEP broadcast at 0x%02X.%02X",
+    if (packet.header.from.endpoint == target_address_.endpoint) {
+      ESP_LOGI(TAG, "Controller responded at 0x%02X.%02X - proceeding with init",
                packet.header.from.address, packet.header.from.endpoint);
       target_address_ = packet.header.from;
-      init_step_ = 1;  // Move to next init step
-      discovery_attempts_ = 0;  // Reset backoff
+      init_step_ = 1;  // Advance to device info requests
+      discovery_attempts_ = 0;
+      last_bus_response_ = millis();
+
+      // Still parse this packet
+      if (packet.header.protocol == DEP) {
+        parse_dep_packet(packet);
+      } else if (packet.header.protocol == DMP) {
+        parse_dmp_packet(packet);
+      }
+      return;
     }
   }
 
@@ -721,16 +728,6 @@ void BusT4Cover::parse_dmp_packet(const T4Packet &packet) {
           }
           ESP_LOGI(TAG, "Product: %s", product_name_.c_str());
 
-          // If still in discovery (step 0), accept PRD response as discovery
-          // Some controllers (e.g., Nice MCA2) respond to PRD but not WHO
-          if (init_step_ == 0 && packet.header.from.endpoint == 0x03) {
-            ESP_LOGI(TAG, "Discovered controller from PRD response at 0x%02X.%02X",
-                     packet.header.from.address, packet.header.from.endpoint);
-            target_address_ = packet.header.from;
-            init_step_ = 1;
-            discovery_attempts_ = 0;
-          }
-
           // Detect device-specific modes based on product name prefix
           if (product_name_.find(PRODUCT_WALKY) == 0) {
             is_walky_ = true;
@@ -835,24 +832,22 @@ void BusT4Cover::parse_oxi_packet(const T4Packet &packet) {
 void BusT4Cover::init_device() {
   // State machine for gradual initialization
   // Each call advances one step to avoid flooding the bus
+  //
+  // NOTE: Step 0 (WHO discovery) is SKIPPED. Many controllers (e.g., Nice MCA2)
+  // do not respond to INF_WHO broadcasts. Instead, we use the target_address_
+  // directly (default 0x00.0x03) and start querying the device immediately.
+  // The target address can be configured via YAML if needed.
 
   switch (init_step_) {
     case 0: {
-      // Step 0: Discover devices on the bus
-      // Send both WHO and PRD queries (like pruwait original)
-      // Some controllers don't respond to WHO but respond to PRD
-      // Also, controllers that don't respond to either will be discovered
-      // from their DEP broadcast packets (handled in on_packet)
+      // Step 0: Send status request to known controller address
+      // Don't advance to step 1 here - wait for on_packet() to confirm
+      // the controller responded before proceeding with init
       discovery_attempts_++;
-      ESP_LOGI(TAG, "Initializing device - discovering... (attempt %d)", discovery_attempts_);
-      T4Source broadcast{0xFF, 0xFF};
-      uint8_t who_msg[5] = { FOR_ALL, INF_WHO, REQ_GET, 0x00, 0x00 };
-      T4Packet who_packet(broadcast, parent_->get_address(), DMP, who_msg, sizeof(who_msg));
-      write(&who_packet, 0);
-      // Also send PRD query - some controllers respond to this but not WHO
-      uint8_t prd_msg[5] = { FOR_ALL, INF_PRD, REQ_GET, 0x00, 0x00 };
-      T4Packet prd_packet(broadcast, parent_->get_address(), DMP, prd_msg, sizeof(prd_msg));
-      write(&prd_packet, 0);
+      ESP_LOGI(TAG, "Requesting status from controller at 0x%02X.%02X (attempt %d)",
+               target_address_.address, target_address_.endpoint, discovery_attempts_);
+      send_info_request(FOR_CU, INF_STATUS);
+      // Stay in step 0 until on_packet() advances us
       break;
     }
 
