@@ -1,3 +1,5 @@
+
+} // namespace esphome::bus_t4
 #pragma once
 
 #include "bus_t4_component.h"
