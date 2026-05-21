@@ -67,6 +67,22 @@ class BusT4Cover : public cover::Cover, public BusT4Device, public Component {
   // Accepts hex string like "55.0C.00.FF..." or "550C00FF..."
   void send_raw_cmd(const std::string &data);
 
+  // Bus health monitoring
+  uint32_t get_last_bus_response() const { return last_bus_response_; }
+  bool is_bus_connected() const;
+
+  // Device info accessors (populated during init)
+  const std::string &get_manufacturer() const { return manufacturer_; }
+  const std::string &get_product_name() const { return product_name_; }
+  const std::string &get_firmware_version() const { return firmware_version_; }
+  const std::string &get_oxi_product() const { return oxi_product_; }
+  const std::string &get_oxi_firmware() const { return oxi_firmware_; }
+
+  // Last remote control event info
+  uint32_t get_last_remote_serial() const { return last_remote_serial_; }
+  uint8_t get_last_remote_button() const { return last_remote_button_; }
+  uint32_t get_last_remote_event_time() const { return last_remote_event_time_; }
+
  protected:
   void control(const cover::CoverCall &call) override;
 
@@ -148,6 +164,14 @@ class BusT4Cover : public cover::Cover, public BusT4Device, public Component {
   // State tracking for change detection
   cover::CoverOperation last_published_op_{cover::COVER_OPERATION_IDLE};
   float last_published_pos_{-1.0f};
+
+  // Bus health monitoring
+  uint32_t last_bus_response_{0};  // millis() of last valid response from controller
+
+  // Remote control event tracking
+  uint32_t last_remote_serial_{0};
+  uint8_t last_remote_button_{0};
+  uint32_t last_remote_event_time_{0};
 
   // Helper methods for learning
   void start_learning_open();
